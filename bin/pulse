@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+set -u
+export LC_ALL=C.UTF-8
+
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+. "$DIR/lib/pulse-lib.sh"
+
+usage() {
+  cat <<USAGE
+pulse — control the Claude Pulse panel (one dot per live Claude Code session)
+
+Usage: pulse <command> [args]        pulse help for this manual
+
+DOTS
+  green           the session is working; a digit inside = running subagents
+  yellow          blocked on you: a question, a permission prompt, a plan approval
+  red             the turn is finished, nothing runs, nothing is asked
+  grey            session open, no prompt sent yet
+  fading ring     prompt cache cooling (1h or 5m TTL); no ring = cache cold
+  Dots vanish when the Claude process exits or the session ends.
+
+MOUSE
+  hover           label, state, model, context %, running time, cache, last message
+  left click      raise the VS Code window, reveal that session's tab, press focusKey
+  right click     Open in VS Code · Move left / right · Unbind · Manual mode switch
+  wheel           up = move the dot left, down = move it right
+
+SESSION SELECTORS  (<s> below)
+  a label (case-insensitive), a VS Code window/workspace name, or an id prefix:
+  pulse status my-feature      pulse bind 8655      pulse move "Billing" left
+
+COMMANDS
+  list                        every tracked session: ● = visible, state, binding
+  status <s>                  full details of one session
+  bind <s> [name]             show the session on the panel, optionally rename it
+  unbind <s>                  remove it from the panel until the next bind
+  label <s> <name>            rename the dot (unlabel is chat-only)
+  focus <s>                   raise the window + reveal the session tab
+  move <s> left|right|first|last|<n>
+                              reorder the dot; sticks to the session and its workspace
+  mode [auto|manual]          auto: every session appears by itself
+                              manual: only sessions after bind appear
+  sound                       show sound settings
+  sound on|off                enable / disable all chimes
+  sound test                  play the completion chime
+  sound list                  names available in the system sound themes
+  sound play <name|file>      audition a sound
+  sound done <name|file|off>  set the completion chime
+  sound waiting <name|file|off>
+                              set the "waiting for you" chime
+  prune                       delete state files whose Claude process is gone
+  help, -h, --help            this manual
+
+IN A CLAUDE CHAT  (typed as a prompt; the hook answers, the model never sees it;
+                   acts on the session you type it in, so no <s> argument)
+  pulse                       status of this session
+  pulse bind [name]           pulse unbind
+  pulse label <name>          pulse unlabel
+  pulse move left|right|first|last|<n>
+  pulse list                  pulse mode auto|manual
+  pulse sound on|off|test     pulse help
+
+CONFIG  ~/.config/claude-pulse/config.json
+  focusKey   key combo pressed after a click, e.g. "ctrl+escape" (needs xdotool
+             and the matching VS Code keybinding for "Claude Code: Focus Input")
+  mode       "auto" | "manual"
+  order      workspace names in display order (written by move)
+  sound      true | false
+  sounds     {"done": "...", "waiting": "..."}  theme sound name, file path or "off"
+
+FILES
+  state      ~/.local/state/claude-pulse/sessions/<session id>.json
+  code       ~/.claude/pulse  (reporters/<provider>/, lib/, ui/gnome/, bin/pulse, test/)
+  settings   hooks + statusLine in ~/.claude/settings.json (installed by install.sh)
+  Reporter and CLI changes apply at once; extension.js changes need Alt+F2, r.
+USAGE
+}
+
+find_session() {
+  local needle="$1" f
+  [ -z "$needle" ] && return 1
+  for f in "$PULSE_SESSIONS_DIR"/*.json; do
+    [ -s "$f" ] || continue
+    if jq -e --arg n "$needle" '(.id == $n) or (.id | startswith($n)) or ((.label // "") | ascii_downcase) == ($n | ascii_downcase) or ((.windowHint // "") | ascii_downcase) == ($n | ascii_downcase)' "$f" >/dev/null 2>&1; then
+      echo "$f"; return 0
+    fi
+  done
+  return 1
+}
+
+need_session() {
+  local f
+  if ! f="$(find_session "${1:-}")"; then
+    echo "pulse: no session matches '${1:-}'. Run 'pulse list'." >&2
+    exit 1
+  fi
+  echo "$f"
+}
+
+normalize_key() {
+  awk -F'+' '{ for (i = 1; i <= NF; i++) { k = $i; if (i == NF && length(k) > 1) k = toupper(substr(k, 1, 1)) substr(k, 2); printf "%s%s", k, (i < NF ? "+" : "") } }'
+}
+
+alive() {
+  local pid="$1" pattern="${2:-.}"
+  [ -n "$pid" ] && [ "$pid" != "null" ] && [ -d "/proc/$pid" ] && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -qi -- "$pattern"
+}
+
+cmd="${1:-list}"; shift || true
+case "$cmd" in
+  list|ls)
+    echo "mode: $(pulse_mode)"
+    found=0
+    for f in "$PULSE_SESSIONS_DIR"/*.json; do
+      [ -s "$f" ] || continue
+      found=1
+      mark="  "; session_visible "$f" && mark="● "
+      printf '%s%s\n' "$mark" "$(describe_session "$f" | head -1)"
+    done
+    if [ "$found" = 0 ]; then echo "  no sessions"; fi
+    ;;
+  status|show|info)
+    describe_session "$(need_session "${1:-}")";;
+  bind)
+    f="$(need_session "${1:-}")"; shift || true
+    id="$(jq -r .id "$f")"
+    update_session "$id" '.bound = true | .hidden = false | if $l != "" then .label = $l | .labelPinned = true else . end' --arg l "${*:-}"
+    echo "bound: $(describe_session "$f" | head -1)";;
+  unbind|hide)
+    f="$(need_session "${1:-}")"
+    update_session "$(jq -r .id "$f")" '.bound = false | .hidden = true'
+    echo "unbound: $(describe_session "$f" | head -1)";;
+  label|rename)
+    f="$(need_session "${1:-}")"; shift || true
+    [ -z "${*:-}" ] && { echo "pulse: label needs a name" >&2; exit 1; }
+    update_session "$(jq -r .id "$f")" '.label = $l | .labelPinned = true' --arg l "$*"
+    echo "labelled: $(describe_session "$f" | head -1)";;
+  focus|open)
+    f="$(need_session "${1:-}")"
+    hint="$(jq -r '.windowHint // empty' "$f")"
+    ws="$(jq -r '.workspaceFile // .cwd' "$f")"
+    id="$(jq -r .id "$f")"
+    if [ -n "$hint" ] && command -v wmctrl >/dev/null && wmctrl -l | grep -i "Visual Studio Code" | grep -q -- "$hint"; then
+      wid="$(wmctrl -l | grep -i "Visual Studio Code" | grep -- "$hint" | head -1 | awk '{print $1}')"
+      wmctrl -i -a "$wid"
+      sleep 0.3
+    else
+      code "$ws"
+      sleep 4
+    fi
+    if jq -e '.reveal.command | arrays' "$f" >/dev/null 2>&1; then
+      mapfile -t reveal < <(jq -r '.reveal.command[]' "$f")
+      "${reveal[@]}" >/dev/null 2>&1 || true
+    fi
+    key="$(config_get '.focusKey' | normalize_key)"
+    [ -n "$key" ] && command -v xdotool >/dev/null && { sleep 0.45; xdotool key --clearmodifiers "$key"; }
+    ;;
+  move|order)
+    f="$(need_session "${1:-}")"; shift || true
+    if pos="$(move_session "$(jq -r .id "$f")" "${1:-}")"; then
+      echo "position: $pos"
+    else
+      echo "pulse: usage: pulse move <label|id> left|right|first|last|<n> (session must be visible)" >&2; exit 1
+    fi;;
+  mode)
+    case "${1:-}" in
+      "") echo "mode: $(pulse_mode)";;
+      auto|manual) config_set '.mode = $m' --arg m "$1"; echo "mode: $1";;
+      *) echo "pulse: mode must be auto or manual" >&2; exit 1;;
+    esac;;
+  sound)
+    case "${1:-}" in
+      on) config_set '.sound = true'; echo "sound: on";;
+      off) config_set '.sound = false'; echo "sound: off";;
+      test) play_sound done; sleep 1; echo "played";;
+      play|try) [ -z "${2:-}" ] && { echo "pulse: sound play <name|file>" >&2; exit 1; }; config_set '.sounds.preview = $n' --arg n "$2"; play_sound preview; sleep 1.5; echo "played: $2";;
+      done|waiting) [ -z "${2:-}" ] && { echo "pulse: sound $1 <name|file|off>" >&2; exit 1; }; config_set ".sounds.$1 = \$n" --arg n "$2"; echo "$1 sound: $2"; play_sound "$1";;
+      list) for d in /usr/share/sounds/freedesktop/stereo /usr/share/sounds/Yaru/stereo /usr/share/sounds/gnome/default/alerts; do [ -d "$d" ] && { echo "$d:"; ls "$d" | sed -e 's/\.[a-z0-9]*$//' -e 's/^/  /' | sort -u; }; done;;
+      "") echo "sound: $(sound_enabled && echo on || echo off)  done=$(config_get '.sounds.done' || true)  waiting=$(config_get '.sounds.waiting' || true)";;
+      *) echo "pulse: sound on|off|test|list|play <name>|done <name>|waiting <name>" >&2; exit 1;;
+    esac;;
+  prune)
+    for f in "$PULSE_SESSIONS_DIR"/*.json; do
+      [ -s "$f" ] || continue
+      pid="$(jq -r '.pid // empty' "$f")"
+      if ! alive "$pid" "$(jq -r '.processPattern // "."' "$f")"; then echo "pruned: $(jq -r '.label // .id' "$f")"; rm -f "$f" "$f.lock"; fi
+    done;;
+  help|-h|--help) usage;;
+  *) usage; exit 1;;
+esac

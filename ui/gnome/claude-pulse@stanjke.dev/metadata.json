@@ -1,0 +1,8 @@
+{
+  "uuid": "claude-pulse@stanjke.dev",
+  "name": "Claude Pulse",
+  "description": "One dot per running Claude Code session: green = working (digit = agents), yellow = waiting for you, red = finished, ring = prompt cache cooling. Hover for details, click to focus the VS Code window.",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "url": "https://github.com/stanjke-dev/claude-pulse",
+  "version": 1
+}

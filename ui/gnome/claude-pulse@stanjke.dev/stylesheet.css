@@ -1,0 +1,28 @@
+.claude-pulse-box {
+  spacing: 6px;
+  padding: 0 4px;
+}
+
+.claude-pulse-count {
+  font-size: 9px;
+  font-weight: bold;
+  color: white;
+}
+
+.claude-pulse-tooltip {
+  background-color: rgba(24, 24, 30, 0.96);
+  color: #e8e8ec;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 12px;
+}
+
+.claude-pulse-tooltip-title {
+  font-weight: bold;
+  font-size: 13px;
+}
+
+.claude-pulse-tooltip-muted {
+  color: #a0a0aa;
+}
